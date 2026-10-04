@@ -7,7 +7,8 @@ name: bench-200m
 #   java-native-{default,tuned,pgo}     — the native-image technique ladder:
 #       default = plain native-image (isolates what tuning buys),
 #       tuned   = winner's flags (-O3, TuneInlinerExploration, -march=native, epsilon GC),
-#       pgo     = tuned + GraalVM profile-guided optimization
+#       pgo     = tuned minus -O3 + GraalVM PGO (-O3 + --pgo silently
+#               produces no binary; proven by pgo-probe run 37227583528)
 # Table reports wall (best of 3), CPU time, peak RSS, page faults, all with
 # byte-identical output gated. Java wall is measured in forking mode (as the
 # winner ships it — the parent exits without waiting for worker teardown);
@@ -125,8 +126,13 @@ jobs:
             echo "training exit: $?"
             ls -la bench-data/*.iprof
             cp bench-data/default.iprof ./default.iprof
+            # Final PGO build: -O3 is EXCLUDED. The pgo-probe discriminator
+            # (run 37227583528) proved -O3 + --pgo makes native-image log
+            # "Finished generating" without producing a binary (phantom).
+            # Keep the other tuned flags: inliner exploration, march=native,
+            # epsilon GC. Matches the instrumented build's flag set.
             # shellcheck disable=SC2086
-            build java-native-pgo --pgo $TUNED_FLAGS
+            build java-native-pgo --pgo $INSTRUMENT_FLAGS
             ls -la java-native-pgo* || true
           fi
           for v in default tuned pgo; do
