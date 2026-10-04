@@ -62,3 +62,7 @@ jobs:
           "$NI" --enable-preview --pgo -o hw-pgo-prev HelloWorld
           echo "pgo-prev build exit: $?"
           ls -la hw-pgo-prev || echo "PHANTOM REPRODUCED with --enable-preview"
+          echo "=== discriminator 2: --pgo + -O3 ==="
+          "$NI" --enable-preview --pgo -O3 -o hw-pgo-o3 HelloWorld
+          echo "pgo-o3 build exit: $?"
+          ls -la hw-pgo-o3 || echo "PHANTOM REPRODUCED with -O3"
