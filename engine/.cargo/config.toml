@@ -1,0 +1,5 @@
+# Build the engine for the machine it runs on: the 1BRC-style hot loop
+# (SWAR scans, unaligned word loads) needs native codegen to reach full
+# speed. This is a benchmark/shipping-binary setting, not a portable default.
+[build]
+rustflags = ["-C", "target-cpu=native"]

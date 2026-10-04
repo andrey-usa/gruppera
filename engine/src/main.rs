@@ -18,20 +18,33 @@ const TABLE_BITS: usize = 17;
 const TABLE_SIZE: usize = 1 << TABLE_BITS;
 const TABLE_MASK: usize = TABLE_SIZE - 1;
 
-/// One hash-table entry. Padded to 64 bytes so entries don't share cache lines.
+/// Rows starting within TAIL_MARGIN bytes of EOF use the scalar parser.
+/// The vectorized path issues 8-byte loads up to ~108 bytes past a row's
+/// start (slow-path name fold + temperature word); with the official
+/// generator's max 100-byte station names, 128 bytes of margin keeps every
+/// load inside the mapping. This replaces UB (page-rounding luck) with a
+/// provably in-bounds tail.
+const TAIL_MARGIN: usize = 128;
+
+/// One hash-table entry: exactly one 64-byte cache line (AoS layout, the
+/// 1BRC winners' slot design). Field order matters — keep the 8-byte fields
+/// first so no alignment padding pushes the struct to 128 bytes.
 #[repr(C, align(64))]
 struct Entry {
-    used: bool,
     hash: u64,
     fp0: u64, // masked first 8 name bytes (full name when len <= 16)
     fp1: u64, // masked next 8 name bytes
     name: *const u8, // points into the mmap; valid until unmap
-    name_len: u32,
+    total: i64, // sum, in tenths
     lo: i32,   // min, in tenths
     hi: i32,   // max, in tenths
-    total: i64, // sum, in tenths
     n: u32,    // count
+    name_len: u32,
+    used: bool,
 }
+
+// Compile-time guard: the slot must stay a single cache line.
+const _: () = assert!(std::mem::size_of::<Entry>() == 64);
 
 impl Entry {
     fn vacant() -> Self {
@@ -268,6 +281,76 @@ unsafe fn accumulate(table: &mut [Entry], idx: usize, v: i32) {
     e.n += 1;
 }
 
+/// Scalar fallback for rows starting within TAIL_MARGIN bytes of EOF.
+/// Every read is provably inside the mapping: the row itself is whole
+/// (chunks are line-aligned), byte scans stay within the row, fingerprints
+/// are built byte-wise, and the only word loads are explicitly bounded
+/// (`wa + 8 <= semi < file_end`). Produces bit-identical table updates to
+/// the vectorized path: same fingerprints, same hash fold, same accumulation.
+#[inline(never)]
+unsafe fn parse_row_scalar(c: &mut Cursor, table: &mut [Entry]) {
+    let p = c.bytes.as_ptr();
+    let start = c.at;
+    // Byte-at-a-time ';' scan; the row is whole, so this terminates in-bounds.
+    let mut semi = start;
+    while *p.add(semi) != b';' {
+        semi += 1;
+    }
+    let len = semi - start;
+    // Fingerprint: first min(len+1, 16) bytes as LE u64s. The +1 covers ';',
+    // exactly matching the fast path's LOW_MASK[len] masking for len <= 15
+    // and the slow path's raw first-16-bytes for len > 15. Byte-built so no
+    // load can cross EOF, even for the final short row.
+    let fp_bytes = (len + 1).min(16);
+    let mut a: u64 = 0;
+    let mut b: u64 = 0;
+    let mut i = 0;
+    while i < fp_bytes && i < 8 {
+        a |= (*p.add(start + i) as u64) << (8 * i);
+        i += 1;
+    }
+    while i < fp_bytes {
+        b |= (*p.add(start + i) as u64) << (8 * (i - 8));
+        i += 1;
+    }
+    let h = if len <= 15 {
+        a ^ b
+    } else {
+        // Same fold as the lookup() slow path (a ^ b == w0 ^ w1): whole
+        // words strictly before the ';' word, then the partial word [wa, semi]
+        // with ';' itself folded in, exactly as the slow path's shift does.
+        let mut h = a ^ b;
+        let mut wa = start + 16;
+        while wa + 8 <= semi {
+            h ^= c.u64_at(wa);
+            wa += 8;
+        }
+        let mut w: u64 = 0;
+        let mut k = 0;
+        while wa + k <= semi {
+            w |= (*p.add(wa + k) as u64) << (8 * k);
+            k += 1;
+        }
+        let tz = (semi - wa) * 8 + 7; // bit index of ';', as in semi_mask
+        h ^= w << (63 - tz);
+        h
+    };
+    let idx = insert_probe(table, p, start, len, h, index_of(h), a, b);
+    // Scalar temperature parse: [-]d[d].d\n
+    let mut at = semi + 1;
+    let neg = *p.add(at) == b'-';
+    at += neg as usize;
+    let mut v: i32 = 0;
+    while *p.add(at) != b'.' {
+        v = v * 10 + (*p.add(at) - b'0') as i32;
+        at += 1;
+    }
+    at += 1; // past '.'
+    v = v * 10 + (*p.add(at) - b'0') as i32;
+    c.at = at + 2; // past digit and '\n'
+    accumulate(table, idx, if neg { -v } else { v });
+}
+
 /// Advance to the next '\n' at or after `at` (SWAR scan, scalar tail).
 unsafe fn align_newline(bytes: &[u8], mut at: usize, end: usize) -> usize {
     let p = bytes.as_ptr();
@@ -288,29 +371,32 @@ unsafe fn align_newline(bytes: &[u8], mut at: usize, end: usize) -> usize {
 fn worker(
     bytes: &[u8],
     cursor: &AtomicUsize,
-    file_end: usize,
+    scan_end: usize,
     out: &mut Vec<(Vec<u8>, i32, i64, i32, u32)>,
 ) {
     let mut table: Vec<Entry> = (0..TABLE_SIZE).map(|_| Entry::vacant()).collect();
+    // scan_end is line-aligned and at least TAIL_MARGIN bytes before EOF
+    // (or 0), so every row the workers touch is fast-path safe with zero
+    // per-row bounds checks; the tail is parsed scalarly by the main thread.
     unsafe {
         loop {
             let claimed = cursor.fetch_add(CHUNK_BYTES, Ordering::Relaxed);
-            if claimed >= file_end {
+            if claimed >= scan_end {
                 break;
             }
-            let seg_end = align_newline(bytes, (claimed + CHUNK_BYTES).min(file_end - 1), file_end);
+            let seg_end = align_newline(bytes, (claimed + CHUNK_BYTES).min(scan_end - 1), scan_end);
             let seg_start = if claimed == 0 {
                 0
             } else {
-                align_newline(bytes, claimed, file_end) + 1
+                align_newline(bytes, claimed, scan_end) + 1
             };
             if seg_start >= seg_end {
                 continue;
             }
             // Three interleaved cursors split the chunk for ILP.
             let third = (seg_end - seg_start) / 3;
-            let b1 = align_newline(bytes, seg_start + third, file_end);
-            let b2 = align_newline(bytes, seg_start + third + third, file_end);
+            let b1 = align_newline(bytes, seg_start + third, scan_end);
+            let b2 = align_newline(bytes, seg_start + third + third, scan_end);
             let mut c1 = Cursor { bytes, at: seg_start, stop: b1 };
             let mut c2 = Cursor { bytes, at: b1 + 1, stop: b2 };
             let mut c3 = Cursor { bytes, at: b2 + 1, stop: seg_end };
@@ -336,6 +422,13 @@ fn worker(
                 }
             }
         }
+        collect_table(&table, out);
+    }
+}
+
+/// Move a per-thread table's results into the merge input.
+fn collect_table(table: &[Entry], out: &mut Vec<(Vec<u8>, i32, i64, i32, u32)>) {
+    unsafe {
         for e in table.iter() {
             if e.used {
                 let name = std::slice::from_raw_parts(e.name, e.name_len as usize).to_vec();
@@ -345,17 +438,43 @@ fn worker(
     }
 }
 
-/// Java-compatible rounding: round half away from zero at one decimal.
+/// Java-compatible rounding: Math.round semantics (half up, i.e. toward
+/// +infinity), then one decimal. Rust's f64::round is half-away-from-zero
+/// and disagrees with the 1BRC reference on negative .5 means.
 fn round1(v: f64) -> f64 {
-    ((v * 10.0).round() as i64) as f64 / 10.0
+    ((v * 10.0 + 0.5).floor() as i64) as f64 / 10.0
 }
 
 fn main() {
     let path = std::env::args().nth(1).unwrap_or_else(|| "measurements.txt".to_string());
     let file = std::fs::File::open(&path).expect("open input");
     let mmap = unsafe { memmap2::Mmap::map(&file).expect("mmap") };
+    // Streaming one-pass access: tell the kernel to readahead aggressively
+    // and drop pages behind us.
+    unsafe {
+        let _ = libc::madvise(
+            mmap.as_ptr() as *mut libc::c_void,
+            mmap.len(),
+            libc::MADV_SEQUENTIAL,
+        );
+    }
     let bytes: &[u8] = &mmap;
     let file_end = bytes.len();
+
+    // Scalar tail: rows starting within TAIL_MARGIN bytes of EOF are parsed
+    // by the main thread with parse_row_scalar, so the workers' 8-byte loads
+    // provably never cross the mapping end. tail_start is the last line start
+    // at or before file_end - TAIL_MARGIN (0 for a sub-128-byte file).
+    let tail_start = if file_end > TAIL_MARGIN {
+        let limit = file_end - TAIL_MARGIN;
+        let mut j = limit - 1;
+        while j > 0 && bytes[j] != b'\n' {
+            j -= 1;
+        }
+        if bytes[j] == b'\n' { j + 1 } else { 0 }
+    } else {
+        0
+    };
 
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
     let cursor = AtomicUsize::new(0);
@@ -365,7 +484,7 @@ fn main() {
         for _ in 0..threads {
             hs.push(s.spawn(|| {
                 let mut v = Vec::new();
-                worker(bytes, &cursor, file_end, &mut v);
+                worker(bytes, &cursor, tail_start, &mut v);
                 v
             }));
         }
@@ -373,6 +492,18 @@ fn main() {
             per_thread.push(h.join().unwrap());
         }
     });
+    if tail_start < file_end {
+        let mut tail_table: Vec<Entry> = (0..TABLE_SIZE).map(|_| Entry::vacant()).collect();
+        let mut c = Cursor { bytes, at: tail_start, stop: file_end };
+        unsafe {
+            while c.live() {
+                parse_row_scalar(&mut c, &mut tail_table);
+            }
+        }
+        let mut v = Vec::new();
+        collect_table(&tail_table, &mut v);
+        per_thread.push(v);
+    }
 
     let mut merged: std::collections::BTreeMap<Vec<u8>, (i32, i64, i32, u32)> =
         std::collections::BTreeMap::new();
