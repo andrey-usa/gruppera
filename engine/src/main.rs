@@ -152,8 +152,10 @@ unsafe fn bytes_eq(a: *const u8, b: *const u8, len: usize) -> bool {
     }
     if i < len {
         let tail = len - i;
-        let am = (a.add(i) as *const u64).read_unaligned() & LOW_MASK[tail];
-        let bm = (b.add(i) as *const u64).read_unaligned() & LOW_MASK[tail];
+        // Loop exited with i+8 > len and i < len: tail in [1,7].
+        let mask = *LOW_MASK.get_unchecked(tail);
+        let am = (a.add(i) as *const u64).read_unaligned() & mask;
+        let bm = (b.add(i) as *const u64).read_unaligned() & mask;
         if am != bm {
             return false;
         }
@@ -177,15 +179,18 @@ unsafe fn lookup(c: &mut Cursor, table: &mut [Entry]) -> usize {
         let n0 = (m0.trailing_zeros() >> 3) as usize;
         let second_active = if n0 == 8 { !0u64 } else { 0u64 };
         let n1 = (m1.trailing_zeros() >> 3) as usize;
-        let a = w0 & LOW_MASK[n0];
-        let b = second_active & w1 & LOW_MASK[n1];
+        // n0, n1 in [0,8] by construction (trailing_zeros of u64, >> 3);
+        // LOW_MASK has 9 entries, so unchecked is safe.
+        let a = w0 & *LOW_MASK.get_unchecked(n0);
+        let b = second_active & w1 & *LOW_MASK.get_unchecked(n1);
         let h = a ^ b;
         let len = n0 + ((n1 as u64 & second_active) as usize);
         c.at += len; // leave cursor ON ';' for parse_tenths
 
         let mut idx = index_of(h);
         {
-            let e = &table[idx];
+            // idx < TABLE_SIZE == table.len() by index_of's mask.
+            let e = &*table.get_unchecked(idx);
             // For len <= 16 the masked pair IS the whole name.
             if e.used && e.fp0 == a && e.fp1 == b && e.name_len as usize == len {
                 return idx;
@@ -227,10 +232,12 @@ unsafe fn masked_pair(c: &Cursor, start: usize, total: usize) -> (u64, u64) {
     let mut a = c.u64_at(start);
     let mut b = c.u64_at(start + 8);
     if total <= 8 {
-        a &= LOW_MASK[total - 1];
+        // total in [1,8]: total-1 in [0,7].
+        a &= *LOW_MASK.get_unchecked(total - 1);
         b = 0;
     } else if total < 16 {
-        b &= LOW_MASK[total - 9];
+        // total in [9,15]: total-9 in [0,6].
+        b &= *LOW_MASK.get_unchecked(total - 9);
     }
     (a, b)
 }
@@ -247,9 +254,10 @@ unsafe fn insert_probe(
     b: u64,
 ) -> usize {
     loop {
-        let e = &table[idx];
+        // idx stays < TABLE_SIZE: index_of masks, step 31 preserves the mask.
+        let e = &*table.get_unchecked(idx);
         if !e.used {
-            let s = &mut table[idx];
+            let s = &mut *table.get_unchecked_mut(idx);
             s.used = true;
             s.hash = h;
             s.fp0 = a;
@@ -269,7 +277,8 @@ unsafe fn insert_probe(
 
 #[inline(always)]
 unsafe fn accumulate(table: &mut [Entry], idx: usize, v: i32) {
-    let e = &mut table[idx];
+    // idx < TABLE_SIZE == table.len(): produced by index_of's mask.
+    let e = &mut *table.get_unchecked_mut(idx);
     // Branchy min/max: taken ~log(n) times per key, predictor learns it.
     if v < e.lo {
         e.lo = v;
