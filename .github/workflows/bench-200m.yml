@@ -43,7 +43,7 @@ jobs:
           git clone --depth 1 --filter=blob:none --sparse \
             https://github.com/gunnarmorling/1brc.git 1brc-upstream
           cd 1brc-upstream
-          git sparse-checkout set \
+          git sparse-checkout set --no-cone --skip-checks \
             src/main/java/dev/morling/onebrc/CreateMeasurements.java \
             src/main/java/dev/morling/onebrc/CalculateAverage_thomaswue.java
           git log --oneline -1
