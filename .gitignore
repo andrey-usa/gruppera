@@ -1,0 +1,6 @@
+data/
+1brc/
+classes/
+*.txt
+!engine/
+target/
