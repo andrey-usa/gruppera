@@ -115,17 +115,18 @@ jobs:
           build java-native-default
           # shellcheck disable=SC2086
           build java-native-tuned $TUNED_FLAGS
-          # PGO: instrument -> train (direct --worker, no fork) -> optimize
+          # PGO: instrument -> train (direct --worker, no fork) -> optimize.
+          # The profile is hoisted to ./default.iprof to keep --pgo path handling trivial.
           # shellcheck disable=SC2086
           build java-native-pgo-instr --pgo-instrument $INSTRUMENT_FLAGS
           if [ -x ./java-native-pgo-instr ]; then
             (cd bench-data && ../java-native-pgo-instr --worker > /dev/null)
-            ls bench-data/*.iprof
+            echo "training exit: $?"
+            ls -la bench-data/*.iprof
+            cp bench-data/default.iprof ./default.iprof
             # shellcheck disable=SC2086
-            "$NI" --enable-preview --pgo=bench-data/default.iprof $TUNED_FLAGS \
-              -cp winner-classes "$MAIN" -o java-native-pgo \
-              > /tmp/native-java-native-pgo.log 2>&1
-            [ -x ./java-native-pgo ] && echo "ok: java-native-pgo" || tail -5 /tmp/native-java-native-pgo.log
+            build java-native-pgo --pgo=default.iprof $TUNED_FLAGS
+            ls -la java-native-pgo* || true
           fi
           for v in default tuned pgo; do
             if [ -x "./java-native-$v" ]; then echo "$v=true"; else echo "$v=false"; fi >> "$GITHUB_OUTPUT"
