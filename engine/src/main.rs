@@ -143,6 +143,19 @@ fn index_of(hash: u64) -> usize {
 /// Compare two byte strings via u64 chunks plus a masked tail.
 #[inline(always)]
 unsafe fn bytes_eq(a: *const u8, b: *const u8, len: usize) -> bool {
+    // Every load stays inside [ptr, ptr + len): this is called from the
+    // scalar tail path too, where the name can end a few bytes before EOF, so
+    // a masked 8-byte tail load would read past the mapping.
+    if len < 8 {
+        let mut i = 0;
+        while i < len {
+            if *a.add(i) != *b.add(i) {
+                return false;
+            }
+            i += 1;
+        }
+        return true;
+    }
     let mut i = 0;
     while i + 8 <= len {
         if (a.add(i) as *const u64).read_unaligned() != (b.add(i) as *const u64).read_unaligned() {
@@ -151,12 +164,9 @@ unsafe fn bytes_eq(a: *const u8, b: *const u8, len: usize) -> bool {
         i += 8;
     }
     if i < len {
-        let tail = len - i;
-        // Loop exited with i+8 > len and i < len: tail in [1,7].
-        let mask = *LOW_MASK.get_unchecked(tail);
-        let am = (a.add(i) as *const u64).read_unaligned() & mask;
-        let bm = (b.add(i) as *const u64).read_unaligned() & mask;
-        if am != bm {
+        // Overlapping final word ending exactly at len (len >= 8 here).
+        let j = len - 8;
+        if (a.add(j) as *const u64).read_unaligned() != (b.add(j) as *const u64).read_unaligned() {
             return false;
         }
     }

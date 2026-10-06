@@ -1,0 +1,35 @@
+name: ci
+
+# Correctness gate for every push: build the engine exactly as it ships
+# (release, native, real mmap) and diff it against a naive reference on
+# randomized inputs. Half the inputs end exactly on a 4 KiB page boundary, so
+# any load past EOF faults instead of reading zero padding.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  correctness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RUSTFLAGS: "-C target-cpu=native"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+
+      - name: Build (release)
+        working-directory: engine
+        run: cargo build --release --locked
+
+      - name: Differential fuzz vs reference (page-aligned EOF)
+        run: python3 tests/fuzz.py engine/target/release/gruppera 120
