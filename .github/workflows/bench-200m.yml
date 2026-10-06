@@ -1,0 +1,250 @@
+name: bench-200m
+
+# Manual 200M-row benchmark on identical hardware.
+# Contenders:
+#   gruppera, gruppera-pgo             — engine with all winning techniques, ±PGO
+#   java-openjdk                       — 1BRC-winning submission on OpenJDK 21
+#   java-native-{default,tuned,pgo}     — the native-image technique ladder:
+#       default = plain native-image (isolates what tuning buys),
+#       tuned   = winner's flags (-O3, TuneInlinerExploration, -march=native, epsilon GC),
+#       pgo     = tuned minus -O3 + GraalVM PGO (-O3 + --pgo silently
+#               produces no binary; proven by pgo-probe run 37227583528)
+# Table reports wall (best of 3), CPU time, peak RSS, page faults, all with
+# byte-identical output gated. Java wall is measured in forking mode (as the
+# winner ships it — the parent exits without waiting for worker teardown);
+# Java CPU/RSS come from a direct --worker run (same code path, exact
+# per-process accounting via wait4).
+
+on:
+  workflow_dispatch:
+    inputs:
+      rows:
+        description: 'Rows to generate with the official 1BRC generator'
+        required: false
+        default: '200000000'
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      ROWS: ${{ inputs.rows }}
+      RUSTFLAGS: "-C target-cpu=native"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+
+      - name: Set up Java 21 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Fetch 1BRC upstream (generator + winning submission)
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/gunnarmorling/1brc.git 1brc-upstream
+          cd 1brc-upstream
+          git sparse-checkout set --no-cone --skip-checks \
+            src/main/java/dev/morling/onebrc/CreateMeasurements.java \
+            src/main/java/dev/morling/onebrc/CalculateAverage_thomaswue.java
+          git log --oneline -1
+
+      - name: Generate dataset
+        run: |
+          mkdir -p gen-classes bench-data
+          javac -d gen-classes \
+            1brc-upstream/src/main/java/dev/morling/onebrc/CreateMeasurements.java
+          cd bench-data
+          time java -cp ../gen-classes dev.morling.onebrc.CreateMeasurements "$ROWS"
+          ls -la measurements.txt
+
+      - name: Build gruppera (base)
+        run: |
+          cd engine
+          cargo build --release
+          cp target/release/gruppera ../gruppera-base
+
+      - name: Build gruppera (PGO)
+        run: |
+          cd engine
+          mkdir -p /tmp/pgo-data
+          RUSTFLAGS="$RUSTFLAGS -Cprofile-generate=/tmp/pgo-data" cargo build --release
+          cp target/release/gruppera /tmp/gruppera-pgo-instr
+          # Train on the real input.
+          /tmp/gruppera-pgo-instr ../bench-data/measurements.txt > /dev/null
+          "$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-profdata" \
+            merge -o /tmp/pgo.profdata /tmp/pgo-data
+          RUSTFLAGS="$RUSTFLAGS -Cprofile-use=/tmp/pgo.profdata" cargo build --release
+          cp target/release/gruppera ../gruppera-pgo
+
+      - name: Compile Java winner (OpenJDK)
+        run: |
+          mkdir -p winner-classes
+          javac --enable-preview --release 21 -d winner-classes \
+            1brc-upstream/src/main/java/dev/morling/onebrc/CalculateAverage_thomaswue.java
+
+      - name: Build Java winner (GraalVM native-image ladder)
+        id: native
+        run: |
+          set +e
+          curl -sSL -o /tmp/graalvm.tar.gz \
+            https://download.oracle.com/graalvm/21/latest/graalvm-jdk-21_linux-x64_bin.tar.gz
+          tar -xzf /tmp/graalvm.tar.gz -C /tmp
+          export GRAALVM_HOME
+          GRAALVM_HOME=$(echo /tmp/graalvm-jdk-21*)
+          NI="$GRAALVM_HOME/bin/native-image"
+          MAIN=dev.morling.onebrc.CalculateAverage_thomaswue
+          TUNED_FLAGS="-O3 -H:TuneInlinerExploration=1 -march=native --gc=epsilon"
+          # --pgo-instrument rejects explicit -O3 (PGO configures opt levels itself)
+          INSTRUMENT_FLAGS="-H:TuneInlinerExploration=1 -march=native --gc=epsilon"
+          build() { # $1 = output name, rest = extra native-image flags
+            local out=$1; shift
+            # shellcheck disable=SC2086
+            "$NI" --enable-preview $* -cp winner-classes "$MAIN" -o "$out" \
+              > "/tmp/native-$out.log" 2>&1
+            if [ -x "./$out" ]; then echo "ok: $out"; else echo "FAILED: $out"; tail -5 "/tmp/native-$out.log"; fi
+          }
+          build java-native-default
+          # shellcheck disable=SC2086
+          build java-native-tuned $TUNED_FLAGS
+          # PGO: instrument -> train (direct --worker, no fork) -> optimize.
+          # The profile is hoisted to ./default.iprof; use the documented
+          # bare --pgo form (it reads ./default.iprof).
+          # shellcheck disable=SC2086
+          build java-native-pgo-instr --pgo-instrument $INSTRUMENT_FLAGS
+          if [ -x ./java-native-pgo-instr ]; then
+            (cd bench-data && ../java-native-pgo-instr --worker > /dev/null)
+            echo "training exit: $?"
+            ls -la bench-data/*.iprof
+            cp bench-data/default.iprof ./default.iprof
+            # Final PGO build: -O3 is EXCLUDED. The pgo-probe discriminator
+            # (run 37227583528) proved -O3 + --pgo makes native-image log
+            # "Finished generating" without producing a binary (phantom).
+            # Keep the other tuned flags: inliner exploration, march=native,
+            # epsilon GC. Matches the instrumented build's flag set.
+            # shellcheck disable=SC2086
+            build java-native-pgo --pgo $INSTRUMENT_FLAGS
+            ls -la java-native-pgo* || true
+          fi
+          for v in default tuned pgo; do
+            if [ -x "./java-native-$v" ]; then echo "$v=true"; else echo "$v=false"; fi >> "$GITHUB_OUTPUT"
+          done
+          set -e
+
+      - name: Run comparisons
+        env:
+          NATIVE_DEFAULT: ${{ steps.native.outputs.default }}
+          NATIVE_TUNED: ${{ steps.native.outputs.tuned }}
+          NATIVE_PGO: ${{ steps.native.outputs.pgo }}
+        run: |
+          cat > /tmp/bench_all.py <<'PYEOF'
+          import subprocess, time, os
+
+          DATA = "bench-data/measurements.txt"
+          N = 3
+          MAIN = "dev.morling.onebrc.CalculateAverage_thomaswue"
+
+          def run_once(argv, cwd="."):
+              """Wall time + exact per-process CPU/RSS via wait4."""
+              proc = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE,
+                                      stderr=subprocess.DEVNULL)
+              t0 = time.perf_counter()
+              out = proc.stdout.read()
+              proc.stdout.close()
+              _, status, ru = os.wait4(proc.pid, 0)
+              dt = time.perf_counter() - t0
+              if os.waitstatus_to_exitcode(status) != 0:
+                  raise RuntimeError(f"{argv} exited with {status}")
+              cpu = ru.ru_utime + ru.ru_stime
+              return dt, cpu, ru.ru_maxrss, ru.ru_minflt, ru.ru_majflt, out
+
+          def bench(name, argv, cwd=".", java_fork=False):
+              if java_fork:
+                  # Exact CPU/RSS need the real worker: run --worker directly
+                  # (same code path, no fork). Wall stays forking-mode below.
+                  _, cpu, rss, minflt, majflt, _ = run_once(argv + ["--worker"], cwd=cwd)
+              else:
+                  run_once(argv, cwd=cwd)  # warmup
+                  cpu = rss = minflt = majflt = None
+              runs = [run_once(argv, cwd=cwd) for _ in range(N)]
+              best = min(runs, key=lambda r: r[0])
+              if not java_fork:
+                  _, cpu, rss, minflt, majflt, _ = best
+              with open(f"out-{name}.txt", "wb") as f:
+                  f.write(best[5])
+              return best[0], cpu, rss, minflt, majflt, [r[0] for r in runs]
+
+          contenders = [
+              ("gruppera", ["./gruppera-base", DATA], ".", False),
+              ("gruppera-pgo", ["./gruppera-pgo", DATA], ".", False),
+              ("java-openjdk",
+               ["java", "--enable-preview", "-cp", "../winner-classes", MAIN],
+               "bench-data", True),
+          ]
+          if os.environ.get("NATIVE_DEFAULT") == "true":
+              contenders.append(("java-native-default", ["../java-native-default"], "bench-data", True))
+          if os.environ.get("NATIVE_TUNED") == "true":
+              contenders.append(("java-native-tuned", ["../java-native-tuned"], "bench-data", True))
+          if os.environ.get("NATIVE_PGO") == "true":
+              contenders.append(("java-native-pgo", ["../java-native-pgo"], "bench-data", True))
+
+          results = {}
+          for name, argv, cwd, java_fork in contenders:
+              results[name] = bench(name, argv, cwd, java_fork)
+
+          with open("/tmp/results.tsv", "w") as f:
+              for name, (wall, cpu, rss_kb, minflt, majflt, runs) in results.items():
+                  f.write(f"{name}\t{wall:.3f}\t{cpu:.3f}\t{rss_kb / 1024:.0f}\t{majflt}\t"
+                          + ",".join(f"{t:.3f}" for t in runs) + "\n")
+          for name, (wall, cpu, rss_kb, minflt, majflt, runs) in results.items():
+              print(f"{name}: wall {wall:.3f}s cpu {cpu:.3f}s rss {rss_kb / 1024:.0f}MB "
+                    f"majflt {majflt} runs [{', '.join(f'{t:.3f}' for t in runs)}]", flush=True)
+          PYEOF
+          python3 /tmp/bench_all.py
+          {
+            echo "## bench-200m — $(date -u +%Y-%m-%d)"
+            echo ""
+            echo "**CPU:** $(grep 'model name' /proc/cpuinfo | head -1 | cut -d: -f2 | xargs) — $(nproc) vCPU · **RAM:** $(free -g | awk '/Mem:/ {print $2}') GB"
+            echo "**Dataset:** $ROWS rows, $(du -h bench-data/measurements.txt | cut -f1) (official 1BRC generator) · **Cache:** warm"
+            echo "PGO (both toolchains) trained on the same input. Java CPU/RSS via direct \`--worker\` run (same code path); Java wall is forking mode as the winner ships it."
+            echo ""
+            echo "| contender | wall (best of 3) | cpu time | peak RSS | major faults | runs |"
+            echo "|---|---|---|---|---|---|"
+            while IFS=$'\t' read -r name wall cpu rssmb majflt runs; do
+              echo "| \`$name\` | ${wall}s | ${cpu}s | ${rssmb} MB | ${majflt} | ${runs}s |"
+            done < /tmp/results.tsv
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY"
+          # Same table as an annotation: readable via the checks API, where
+          # step summaries and logs are not (agent sandboxes).
+          python3 - <<'PYEOF'
+          import os
+          t = open(os.environ["GITHUB_STEP_SUMMARY"], encoding="utf-8").read()[-3500:]
+          enc = t.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          print(f"::notice title=bench-200m results::{enc}")
+          PYEOF
+
+      - name: Verify byte-identical output
+        run: |
+          cmp out-gruppera.txt out-java-openjdk.txt \
+            && echo "gruppera == java-openjdk: BYTE-IDENTICAL"
+          cmp out-gruppera-pgo.txt out-java-openjdk.txt \
+            && echo "gruppera-pgo == java-openjdk: BYTE-IDENTICAL"
+          check_native() { # $1 = variant, $2 = available flag
+            if [ "$2" = "true" ]; then
+              cmp "out-gruppera.txt" "out-java-native-$1.txt" \
+                && echo "gruppera == java-native-$1: BYTE-IDENTICAL"
+            fi
+          }
+          check_native default "${{ steps.native.outputs.default }}"
+          check_native tuned "${{ steps.native.outputs.tuned }}"
+          check_native pgo "${{ steps.native.outputs.pgo }}"
