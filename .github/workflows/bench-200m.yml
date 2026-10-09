@@ -222,8 +222,7 @@ jobs:
             done < /tmp/results.tsv
           } >> "$GITHUB_STEP_SUMMARY"
           cat "$GITHUB_STEP_SUMMARY"
-          # Same table as an annotation: readable via the checks API, where
-          # step summaries and logs are not (agent sandboxes).
+          # Same table as an annotation, readable through the checks API.
           python3 - <<'PYEOF'
           import os
           t = open(os.environ["GITHUB_STEP_SUMMARY"], encoding="utf-8").read()[-3500:]
