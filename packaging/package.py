@@ -27,12 +27,15 @@ import tarfile
 import zipfile
 from pathlib import Path
 
-# Rust target -> (npm os, npm cpu, wheel platform tag, Homebrew os/arch)
+# Rust target -> (npm os, npm cpu, wheel platform tag, Homebrew os/arch). The
+# musl builds are static and run on any Linux; the gnu ones need glibc 2.28.
 TARGETS = {
     "x86_64-unknown-linux-musl": (
         "linux", "x64", "manylinux_2_17_x86_64.manylinux2014_x86_64.musllinux_1_1_x86_64", ("linux", "intel")),
     "aarch64-unknown-linux-musl": (
         "linux", "arm64", "manylinux_2_17_aarch64.manylinux2014_aarch64.musllinux_1_1_aarch64", ("linux", "arm")),
+    "x86_64-unknown-linux-gnu": ("linux", "x64", "manylinux_2_28_x86_64", ("linux", "intel")),
+    "aarch64-unknown-linux-gnu": ("linux", "arm64", "manylinux_2_28_aarch64", ("linux", "arm")),
     "x86_64-apple-darwin": ("darwin", "x64", "macosx_10_12_x86_64", ("macos", "intel")),
     "aarch64-apple-darwin": ("darwin", "arm64", "macosx_11_0_arm64", ("macos", "arm")),
     "x86_64-pc-windows-msvc": ("win32", "x64", "win_amd64", None),
@@ -100,10 +103,14 @@ def npm(args) -> None:
     for target, archive, _ in archives(Path(args.dist), args.name):
         os_, cpu = TARGETS[target][:2]
         pkg = f"{args.name}-{os_}-{cpu}"
+        if pkg in optional:
+            raise SystemExit(f"two archives map to the npm package {pkg}; ship one libc per platform")
         exe, data = binary(archive, args.name)
         write_exe(root / pkg / "bin" / exe, data)
         meta = {"name": pkg, **common, "description": f"The {os_}-{cpu} binary for {args.name}.",
                 "os": [os_], "cpu": [cpu], "files": ["bin"], "preferUnplugged": True}
+        if target.endswith("-linux-gnu"):
+            meta["libc"] = ["glibc"]
         (root / pkg / "package.json").write_text(json.dumps(meta, indent=2) + "\n")
         (root / pkg / "README.md").write_text(
             f"# {pkg}\n\nThe {os_}-{cpu} binary for [{args.name}](https://github.com/{args.repo}). "

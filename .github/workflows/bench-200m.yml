@@ -34,7 +34,7 @@ jobs:
       ROWS: ${{ inputs.rows }}
       RUSTFLAGS: "-C target-cpu=native"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@v2
@@ -43,7 +43,7 @@ jobs:
           components: llvm-tools-preview
 
       - name: Set up Java 21 (Temurin)
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: 21
