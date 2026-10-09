@@ -66,7 +66,7 @@ jobs:
           elif [ "${GITHUB_REF#refs/tags/}" != "$GITHUB_REF" ]; then
             tag="$GITHUB_REF_NAME"; ref="$GITHUB_REF"; publish=true
           else
-            tag=""; ref="$GITHUB_REF"; publish=false   # release-test/* dry run
+            tag=""; ref="$GITHUB_SHA"; publish=false   # release-test/* dry run
           fi
           if [ -n "$tag" ]; then
             have=$(git show "$ref:Cargo.toml" | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)
@@ -170,9 +170,12 @@ jobs:
     outputs:
       version: ${{ steps.meta.outputs.version }}
     steps:
+      # The packaging script comes from this workflow's commit; the version,
+      # description, README and license from the release ref (which is an
+      # older tag when a release is rebuilt).
       - uses: actions/checkout@v7
         with:
-          ref: ${{ needs.plan.outputs.ref }}
+          fetch-depth: 0
       - uses: actions/download-artifact@v8
         with:
           path: dist
@@ -181,10 +184,14 @@ jobs:
         with:
           node-version: 24
       - id: meta
+        env:
+          REF: ${{ needs.plan.outputs.ref }}
         run: |
+          mkdir -p release-ref
+          for f in Cargo.toml README.md LICENSE; do git show "$REF:$f" > "release-ref/$f" 2>/dev/null || rm -f "release-ref/$f"; done
           python3 - >> "$GITHUB_OUTPUT" <<'EOF'
           import tomllib
-          pkg = tomllib.load(open("Cargo.toml", "rb"))["package"]
+          pkg = tomllib.load(open("release-ref/Cargo.toml", "rb"))["package"]
           print(f"version={pkg['version']}")
           print(f"description={pkg['description']}")
           print(f"keywords={','.join(pkg.get('keywords', []))}")
@@ -197,7 +204,8 @@ jobs:
         run: |
           for kind in npm wheel homebrew scoop; do
             python3 packaging/package.py "$kind" --name gruppera --version "$VERSION" --dist dist --out pkg \
-              --repo "$GITHUB_REPOSITORY" --description "$DESCRIPTION" --keywords "$KEYWORDS"
+              --repo "$GITHUB_REPOSITORY" --description "$DESCRIPTION" --keywords "$KEYWORDS" \
+              --readme release-ref/README.md --license-file release-ref/LICENSE
           done
           for dir in pkg/npm/*/; do (cd "$dir" && npm pack --silent); done
       - name: Install and run them
