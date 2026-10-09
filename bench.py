@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import subprocess, sys, time
-b = sys.argv[1] if len(sys.argv) > 1 else "./engine/target/release/gruppera"
+b = sys.argv[1] if len(sys.argv) > 1 else "./target/release/gruppera"
 f = sys.argv[2] if len(sys.argv) > 2 else "data/measurements.txt"
 n = int(sys.argv[3]) if len(sys.argv) > 3 else 5
 best = float('inf')

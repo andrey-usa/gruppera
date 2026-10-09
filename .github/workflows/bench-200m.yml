@@ -8,7 +8,7 @@ name: bench-200m
 #       default = plain native-image (isolates what tuning buys),
 #       tuned   = winner's flags (-O3, TuneInlinerExploration, -march=native, epsilon GC),
 #       pgo     = tuned minus -O3 + GraalVM PGO (-O3 + --pgo silently
-#               produces no binary; proven by pgo-probe run 37227583528)
+#               produces no binary; proven in run 37227583528)
 # Table reports wall (best of 3), CPU time, peak RSS, page faults, all with
 # byte-identical output gated. Java wall is measured in forking mode (as the
 # winner ships it — the parent exits without waiting for worker teardown);
@@ -69,22 +69,20 @@ jobs:
 
       - name: Build gruppera (base)
         run: |
-          cd engine
-          cargo build --release
-          cp target/release/gruppera ../gruppera-base
+          cargo build --release --locked
+          cp target/release/gruppera gruppera-base
 
       - name: Build gruppera (PGO)
         run: |
-          cd engine
           mkdir -p /tmp/pgo-data
           RUSTFLAGS="$RUSTFLAGS -Cprofile-generate=/tmp/pgo-data" cargo build --release
           cp target/release/gruppera /tmp/gruppera-pgo-instr
           # Train on the real input.
-          /tmp/gruppera-pgo-instr ../bench-data/measurements.txt > /dev/null
+          /tmp/gruppera-pgo-instr bench-data/measurements.txt > /dev/null
           "$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-profdata" \
             merge -o /tmp/pgo.profdata /tmp/pgo-data
           RUSTFLAGS="$RUSTFLAGS -Cprofile-use=/tmp/pgo.profdata" cargo build --release
-          cp target/release/gruppera ../gruppera-pgo
+          cp target/release/gruppera gruppera-pgo
 
       - name: Compile Java winner (OpenJDK)
         run: |
@@ -126,7 +124,7 @@ jobs:
             echo "training exit: $?"
             ls -la bench-data/*.iprof
             cp bench-data/default.iprof ./default.iprof
-            # Final PGO build: -O3 is EXCLUDED. The pgo-probe discriminator
+            # Final PGO build: -O3 is EXCLUDED. A discriminator build
             # (run 37227583528) proved -O3 + --pgo makes native-image log
             # "Finished generating" without producing a binary (phantom).
             # Keep the other tuned flags: inliner exploration, march=native,

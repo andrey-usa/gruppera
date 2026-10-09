@@ -4,7 +4,7 @@ High-performance station-temperature aggregation engine, written in Rust.
 
 ## Status
 
-Early development. On 200M rows (2.6 GB, official 1BRC generator, warm cache,
+On 200M rows (2.6 GB, official 1BRC generator, warm cache,
 4 vCPU GitHub runner) gruppera is within 5% of the 1BRC winner (thomaswue)
 built the way it ships, as a GraalVM native image, ties it on CPU time, and
 runs 1.76× faster than the winner on the JVM — with byte-identical output
@@ -41,21 +41,42 @@ against a naive reference on randomized inputs — name lengths around every
 SWAR path boundary, multibyte UTF-8, 100-byte names, 10k-station multi-chunk
 files, tiny files — with half the inputs ending exactly on a 4 KiB page so
 any read past EOF faults. Output order matches Java's `TreeMap<String>`
-(UTF-16 code units). Agent workflow notes: [AGENTS.md](AGENTS.md).
+(UTF-16 code units).
 
-## Build
+## Install
+
+Prebuilt binaries for Linux (x86_64, aarch64), macOS (arm64, x86_64) and
+Windows (x64) are on the [releases page](https://github.com/andrey-usa/gruppera/releases),
+and the same binaries through package managers:
+
+| | |
+|---|---|
+| Cargo | `cargo install --locked gruppera` |
+| npm | `npm install -g gruppera` |
+| pip / uv | `pip install gruppera` · `uv tool install gruppera` |
+| Homebrew | `brew install andrey-usa/tap/gruppera` |
+| Scoop | `scoop bucket add andrey-usa https://github.com/andrey-usa/scoop-bucket` then `scoop install gruppera` |
+
+The prebuilt x86_64 binaries target `x86-64-v2` so they run on any CPU from
+the last fifteen years. For the numbers above, build for your own machine:
 
 ```sh
-cd engine
-RUSTFLAGS="-C target-cpu=native" cargo build --release
+cargo build --release      # .cargo/config.toml sets -C target-cpu=native
 ```
 
 ## Run
 
 ```sh
-./target/release/gruppera measurements.txt
+gruppera measurements.txt
 ```
+
+Input is the 1BRC format, one `<station>;<temperature>` row per line;
+output is `{station=min/mean/max, ...}` sorted by station name.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-TBD — the author will choose a license before the first release.
+[MIT](LICENSE)

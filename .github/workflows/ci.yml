@@ -1,9 +1,9 @@
 name: ci
 
-# Correctness gate for every push: build the engine exactly as it ships
-# (release, native, real mmap) and diff it against a naive reference on
-# randomized inputs. Half the inputs end exactly on a 4 KiB page boundary, so
-# any load past EOF faults instead of reading zero padding.
+# Correctness gate for every push: build the engine as it ships (release,
+# real mmap) and diff it against a naive reference on randomized inputs. Half
+# the inputs end exactly on a 4 KiB page boundary, so any load past EOF
+# faults instead of reading zero padding.
 
 on:
   push:
@@ -14,22 +14,46 @@ permissions:
   contents: read
 
 jobs:
-  correctness:
+  lint:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    env:
-      RUSTFLAGS: "-C target-cpu=native"
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v2
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           toolchain: stable
+          components: clippy, rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: python3 -m py_compile tests/fuzz.py bench.py packaging/package.py
 
-      - name: Build (release)
-        working-directory: engine
+  correctness:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+      - name: Build (release, native)
         run: cargo build --release --locked
-
       - name: Differential fuzz vs reference (page-aligned EOF)
-        run: python3 tests/fuzz.py engine/target/release/gruppera 120
+        run: python3 tests/fuzz.py target/release/gruppera${{ runner.os == 'Windows' && '.exe' || '' }} 120
+
+  # The oldest Rust that builds gruppera (rust-version in Cargo.toml).
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: msrv
+        run: echo "version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - run: cargo check --locked --release

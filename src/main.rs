@@ -13,6 +13,11 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// Per-station accumulators: (min, sum, max) in tenths, and the row count.
+type Stats = (i32, i64, i32, u32);
+/// A station name with its accumulators, as collected from one table.
+type StationRow = (Vec<u8>, i32, i64, i32, u32);
+
 const CHUNK_BYTES: usize = 1 << 21;
 const TABLE_BITS: usize = 17;
 const TABLE_SIZE: usize = 1 << TABLE_BITS;
@@ -32,13 +37,13 @@ const TAIL_MARGIN: usize = 128;
 #[repr(C, align(64))]
 struct Entry {
     hash: u64,
-    fp0: u64, // masked first 8 name bytes (full name when len <= 16)
-    fp1: u64, // masked next 8 name bytes
+    fp0: u64,        // masked first 8 name bytes (full name when len <= 16)
+    fp1: u64,        // masked next 8 name bytes
     name: *const u8, // points into the mmap; valid until unmap
-    total: i64, // sum, in tenths
-    lo: i32,   // min, in tenths
-    hi: i32,   // max, in tenths
-    n: u32,    // count
+    total: i64,      // sum, in tenths
+    lo: i32,         // min, in tenths
+    hi: i32,         // max, in tenths
+    n: u32,          // count
     name_len: u32,
     used: bool,
 }
@@ -127,6 +132,8 @@ unsafe fn parse_tenths(c: &mut Cursor) -> i32 {
     let neg_mask = (((!w) << 59) as i64 >> 63) as u64; // all-ones if '-'
     let no_sign = w & !(neg_mask & 0xFF);
     // Pack the three digit nibbles, then one multiply extracts 100*X+10*Y+Z.
+    // The mask is grouped by digit position, not by 4 hex digits.
+    #[allow(clippy::unusual_byte_groupings)]
     let nibbles = ((no_sign << shift) & 0x0F00_0F0F_00) as u128;
     let mag = (((nibbles * 0x640A_0001) >> 32) & 0x3FF) as i64;
     let signed = (mag ^ (neg_mask as i64)).wrapping_sub(neg_mask as i64);
@@ -200,7 +207,7 @@ unsafe fn lookup(c: &mut Cursor, table: &mut [Entry]) -> usize {
         let mut idx = index_of(h);
         {
             // idx < TABLE_SIZE == table.len() by index_of's mask.
-            let e = &*table.get_unchecked(idx);
+            let e = table.get_unchecked(idx);
             // For len <= 16 the masked pair IS the whole name.
             if e.used && e.fp0 == a && e.fp1 == b && e.name_len as usize == len {
                 return idx;
@@ -214,7 +221,6 @@ unsafe fn lookup(c: &mut Cursor, table: &mut [Entry]) -> usize {
     // hash until the ';' chunk, then mask its tail.
     let mut h = w0 ^ w1;
     c.at += 16;
-    let len: usize;
     loop {
         let w = c.u64_here();
         let m = semi_mask(w);
@@ -227,7 +233,7 @@ unsafe fn lookup(c: &mut Cursor, table: &mut [Entry]) -> usize {
         h ^= w;
         c.at += 8;
     }
-    len = c.at - start;
+    let len = c.at - start;
     // Leave cursor ON ';' for parse_tenths.
     let total = len + 1;
     let (a, b) = masked_pair(c, start, total);
@@ -253,6 +259,7 @@ unsafe fn masked_pair(c: &Cursor, start: usize, total: usize) -> (u64, u64) {
 }
 
 /// Linear probe (step 31) with full byte comparison on fingerprint hit.
+#[allow(clippy::too_many_arguments)]
 unsafe fn insert_probe(
     table: &mut [Entry],
     base: *const u8,
@@ -265,7 +272,7 @@ unsafe fn insert_probe(
 ) -> usize {
     loop {
         // idx stays < TABLE_SIZE: index_of masks, step 31 preserves the mask.
-        let e = &*table.get_unchecked(idx);
+        let e = table.get_unchecked(idx);
         if !e.used {
             let s = &mut *table.get_unchecked_mut(idx);
             s.used = true;
@@ -387,12 +394,7 @@ unsafe fn align_newline(bytes: &[u8], mut at: usize, end: usize) -> usize {
     at.min(end.saturating_sub(1))
 }
 
-fn worker(
-    bytes: &[u8],
-    cursor: &AtomicUsize,
-    scan_end: usize,
-    out: &mut Vec<(Vec<u8>, i32, i64, i32, u32)>,
-) {
+fn worker(bytes: &[u8], cursor: &AtomicUsize, scan_end: usize, out: &mut Vec<StationRow>) {
     let mut table: Vec<Entry> = (0..TABLE_SIZE).map(|_| Entry::vacant()).collect();
     // scan_end is line-aligned and at least TAIL_MARGIN bytes before EOF
     // (or 0), so every row the workers touch is fast-path safe with zero
@@ -404,11 +406,7 @@ fn worker(
                 break;
             }
             let seg_end = align_newline(bytes, (claimed + CHUNK_BYTES).min(scan_end - 1), scan_end);
-            let seg_start = if claimed == 0 {
-                0
-            } else {
-                align_newline(bytes, claimed, scan_end) + 1
-            };
+            let seg_start = if claimed == 0 { 0 } else { align_newline(bytes, claimed, scan_end) + 1 };
             if seg_start >= seg_end {
                 continue;
             }
@@ -446,7 +444,7 @@ fn worker(
 }
 
 /// Move a per-thread table's results into the merge input.
-fn collect_table(table: &[Entry], out: &mut Vec<(Vec<u8>, i32, i64, i32, u32)>) {
+fn collect_table(table: &[Entry], out: &mut Vec<StationRow>) {
     unsafe {
         for e in table.iter() {
             if e.used {
@@ -464,18 +462,37 @@ fn round1(v: f64) -> f64 {
     ((v * 10.0 + 0.5).floor() as i64) as f64 / 10.0
 }
 
+const USAGE: &str = "usage: gruppera [<measurements.txt>]
+
+Reads `<station>;<temperature>` rows (default: ./measurements.txt) and prints
+{station=min/mean/max, ...} sorted by station name, like the 1BRC reference.";
+
 fn main() {
-    let path = std::env::args().nth(1).unwrap_or_else(|| "measurements.txt".to_string());
-    let file = std::fs::File::open(&path).expect("open input");
+    let path = match std::env::args().nth(1).as_deref() {
+        Some("-V" | "--version") => {
+            println!("gruppera {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        Some("-h" | "--help") => {
+            println!("{USAGE}");
+            return;
+        }
+        Some(path) => path.to_string(),
+        None => "measurements.txt".to_string(),
+    };
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("gruppera: {path}: {e}\n\n{USAGE}");
+            std::process::exit(1);
+        }
+    };
     let mmap = unsafe { memmap2::Mmap::map(&file).expect("mmap") };
     // Streaming one-pass access: tell the kernel to readahead aggressively
     // and drop pages behind us.
+    #[cfg(unix)]
     unsafe {
-        let _ = libc::madvise(
-            mmap.as_ptr() as *mut libc::c_void,
-            mmap.len(),
-            libc::MADV_SEQUENTIAL,
-        );
+        let _ = libc::madvise(mmap.as_ptr() as *mut libc::c_void, mmap.len(), libc::MADV_SEQUENTIAL);
     }
     let bytes: &[u8] = &mmap;
     let file_end = bytes.len();
@@ -490,14 +507,18 @@ fn main() {
         while j > 0 && bytes[j] != b'\n' {
             j -= 1;
         }
-        if bytes[j] == b'\n' { j + 1 } else { 0 }
+        if bytes[j] == b'\n' {
+            j + 1
+        } else {
+            0
+        }
     } else {
         0
     };
 
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
     let cursor = AtomicUsize::new(0);
-    let mut per_thread: Vec<Vec<(Vec<u8>, i32, i64, i32, u32)>> = Vec::new();
+    let mut per_thread: Vec<Vec<StationRow>> = Vec::new();
     std::thread::scope(|s| {
         let mut hs = Vec::new();
         for _ in 0..threads {
@@ -524,8 +545,7 @@ fn main() {
         per_thread.push(v);
     }
 
-    let mut merged: std::collections::BTreeMap<Vec<u8>, (i32, i64, i32, u32)> =
-        std::collections::BTreeMap::new();
+    let mut merged: std::collections::BTreeMap<Vec<u8>, Stats> = std::collections::BTreeMap::new();
     for tv in &per_thread {
         for (name, lo, total, hi, n) in tv {
             merged
@@ -549,7 +569,7 @@ fn main() {
     // U+E000..U+FFFF char against an astral one (UTF-8: EF.. < F0..; UTF-16:
     // 0xE000.. > surrogate 0xD8..), but byte-identical output must hold for
     // any input, so sort the (few thousand) keys the way Java does.
-    let mut rows: Vec<(&Vec<u8>, &(i32, i64, i32, u32))> = merged.iter().collect();
+    let mut rows: Vec<(&Vec<u8>, &Stats)> = merged.iter().collect();
     rows.sort_by_cached_key(|(name, _)| String::from_utf8_lossy(name).encode_utf16().collect::<Vec<u16>>());
     let mut s = String::from("{");
     for (i, (name, (lo, total, hi, n))) in rows.into_iter().enumerate() {
