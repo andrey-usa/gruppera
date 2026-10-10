@@ -1,0 +1,24 @@
+[package]
+name = "gruppera"
+version = "0.4.0"
+edition = "2021"
+description = "Fast station-temperature aggregation (One Billion Row Challenge format): mmap, SWAR parsing, byte-identical output to the Java reference."
+license = "MIT"
+repository = "https://github.com/andrey-usa/gruppera"
+homepage = "https://github.com/andrey-usa/gruppera"
+readme = "README.md"
+rust-version = "1.78"
+keywords = ["1brc", "aggregation", "performance", "simd", "cli"]
+categories = ["command-line-utilities", "science"]
+include = ["/src/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE", "/CHANGELOG.md"]
+
+[dependencies]
+memmap2 = "0.9"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
